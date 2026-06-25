@@ -1,0 +1,15 @@
+[2026-06-25 10:43:59] [INFO] [core] Loaded 152 size codes from Stone Size.xlsx
+[2026-06-25 10:43:59] [INFO] [core] Loaded 152 size codes from Stone Shape Size.xlsx
+[2026-06-25 10:43:59] [INFO] [core] Initialized database size matcher with 152 unique size codes.
+[2026-06-25 10:43:59] [INFO] [app] ============================================================
+[2026-06-25 10:43:59] [INFO] [app]   JewelFX – Style Master Bulk Importer Backend
+[2026-06-25 10:43:59] [INFO] [app]   Access on this server PC: http://localhost:8000
+[2026-06-25 10:43:59] [INFO] [app]   Access from other office PCs: http://192.168.29.107:8000
+[2026-06-25 10:43:59] [INFO] [app] ============================================================
+INFO:     Started server process [11224]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+[2026-06-25 11:21:39] [INFO] [core] Loaded 152 size codes from Stone Size.xlsx
+[2026-06-25 11:21:39] [INFO] [core] Loaded 152 size codes from Stone Shape Size.xlsx
+[2026-06-25 11:21:39] [INFO] [core] Hot-reloaded size DB: 152 unique sizes loaded.

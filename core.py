@@ -1,0 +1,1874 @@
+import os
+import re
+import time
+import json
+import uuid
+import threading
+from datetime import date, datetime
+from pathlib import Path
+import openpyxl
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+
+from config import get_logger, TEMPLATE_PATH, OUTPUT_PATH, STONE_SIZE_PATH, STONE_SHAPE_SIZE_PATH
+
+logger = get_logger("core")
+
+# Gati database size matching initialization
+_valid_gati_sizes = set()
+_canonical_size_map = {}
+
+# Sentinel prefix used to flag sizes that are NOT found in Gati's database
+SIZE_NOT_IN_DB_PREFIX = "âš ï¸ "
+
+def _canonical_size(sz_str: str) -> str:
+    """Normalize a size string for fuzzy comparison."""
+    return str(sz_str).strip().lower().replace(" ", "").replace("*", "x").replace("mm", "")
+
+def load_gati_sizes():
+    """Loads valid size codes from Gati master Excel files into memory maps."""
+    global _valid_gati_sizes, _canonical_size_map
+    new_sizes = set()
+    new_map = {}
+    for p in [STONE_SIZE_PATH, STONE_SHAPE_SIZE_PATH]:
+        if p.exists():
+            try:
+                wb = openpyxl.load_workbook(str(p), data_only=True)
+                ws = wb.active
+                size_col = 3 if p.name == "Stone Size.xlsx" else 4
+                for r in range(2, ws.max_row + 1):
+                    val = ws.cell(row=r, column=size_col).value
+                    if val is not None:
+                        val_str = str(val).strip()
+                        new_sizes.add(val_str)
+                        new_map[_canonical_size(val_str)] = val_str
+                logger.info(f"Loaded {len(new_sizes)} size codes from {p.name}")
+            except Exception as e:
+                logger.error(f"Failed to load size codes from {p.name}: {e}")
+        else:
+            logger.warning(f"Size file not found: {p}")
+    _valid_gati_sizes = new_sizes
+    _canonical_size_map = new_map
+    return len(new_sizes)
+
+def reload_gati_sizes() -> dict:
+    """Public function to hot-reload the Gati size database without restarting."""
+    try:
+        count = load_gati_sizes()
+        logger.info(f"Hot-reloaded size DB: {count} unique sizes loaded.")
+        return {"status": "ok", "loaded": count, "sizes": sorted(list(_valid_gati_sizes))}
+    except Exception as e:
+        logger.error(f"Failed to reload size DB: {e}")
+        return {"status": "error", "message": str(e)}
+
+def get_all_gati_sizes() -> list:
+    """Returns the currently loaded list of all valid Gati sizes (sorted)."""
+    return sorted(list(_valid_gati_sizes))
+
+try:
+    load_gati_sizes()
+    logger.info(f"Initialized database size matcher with {len(_valid_gati_sizes)} unique size codes.")
+except Exception as e:
+    logger.error(f"Error initializing size codes: {e}")
+
+_last_mtimes = {}
+def start_auto_sync():
+    def poll_mtimes():
+        global _last_mtimes
+        paths = [STONE_SIZE_PATH, STONE_SHAPE_SIZE_PATH]
+        for p in paths:
+            if p.exists():
+                try:
+                    _last_mtimes[p] = p.stat().st_mtime
+                except Exception:
+                    pass
+        while True:
+            time.sleep(2)
+            changed = False
+            for p in paths:
+                if p.exists():
+                    try:
+                        mtime = p.stat().st_mtime
+                        if p not in _last_mtimes or mtime != _last_mtimes[p]:
+                            _last_mtimes[p] = mtime
+                            changed = True
+                    except Exception:
+                        pass
+            if changed:
+                logger.info("Auto-Sync: Gati Master DB file modifications detected. Reloading sizes...")
+                try:
+                    reload_gati_sizes()
+                except Exception as e:
+                    logger.error(f"Auto-Sync reload failed: {e}")
+
+    t = threading.Thread(target=poll_mtimes, daemon=True, name="GatiDbAutoSync")
+    t.start()
+
+start_auto_sync()
+
+
+def match_gati_size(size_str: str) -> str:
+    """Matches a parsed size string against Gati's master database size codes.
+    
+    Returns the exact Gati size code if found.
+    Returns SIZE_NOT_IN_DB_PREFIX + formatted_size if the size is not in the DB,
+    so the user can review and correct it before importing to Gati.
+    """
+    if not size_str:
+        return ""
+    
+    user_size = str(size_str).strip()
+    
+    # Strip leading warning prefix if re-processing
+    if user_size.startswith(SIZE_NOT_IN_DB_PREFIX):
+        user_size = user_size[len(SIZE_NOT_IN_DB_PREFIX):].strip()
+    
+    # 1. Direct canonical match
+    canon = _canonical_size(user_size)
+    if canon in _canonical_size_map:
+        return _canonical_size_map[canon]
+
+    # 2. Fuzzy 2D match (e.g. 3.50x1.80 -> 3.50 x 1.8)
+    m_2d = re.match(r'^([\d.]+)[x\*]([\d.]+)$', canon)
+    if m_2d:
+        try:
+            val_a = float(m_2d.group(1))
+            val_b = float(m_2d.group(2))
+            for vs in _valid_gati_sizes:
+                m_vs = re.match(r'^([\d.]+)\s*[x\*X]\s*([\d.]+)$', vs.strip())
+                if m_vs:
+                    vs_a = float(m_vs.group(1))
+                    vs_b = float(m_vs.group(2))
+                    if abs(val_a - vs_a) < 0.01 and abs(val_b - vs_b) < 0.01:
+                        logger.info(f"Fuzzy 2D size match: '{user_size}' -> '{vs}'")
+                        return vs
+        except Exception:
+            pass
+            
+    # 3. Fuzzy 1D match (e.g. 0.90 -> 0.9)
+    m_1d = re.match(r'^([\d.]+)$', canon)
+    if m_1d:
+        try:
+            val_val = float(m_1d.group(1))
+            for vs in _valid_gati_sizes:
+                m_vs = re.match(r'^([\d.]+)$', vs.strip())
+                if m_vs:
+                    vs_val = float(m_vs.group(1))
+                    if abs(val_val - vs_val) < 0.01:
+                        logger.info(f"Fuzzy 1D size match: '{user_size}' -> '{vs}'")
+                        return vs
+        except Exception:
+            pass
+    
+    # 4. Not found in DB â€” format nicely and flag with warning prefix
+    formatted = user_size.replace(" ", "").replace("*", "x").replace("X", "x")
+    formatted = formatted.replace("x", " x ")
+    flagged = SIZE_NOT_IN_DB_PREFIX + formatted
+    logger.warning(f"Size '{user_size}' NOT found in Gati size DB. Flagged as: {flagged}")
+    return flagged
+
+# Thread safety lock for EasyOCR
+_reader = None
+_ocr_lock = threading.Lock()
+
+def get_ocr_reader():
+    """Returns a thread-safe singleton instance of the EasyOCR Reader."""
+    global _reader
+    if _reader is None:
+        with _ocr_lock:
+            if _reader is None:
+                import easyocr
+                logger.info("Initializing EasyOCR Reader (CPU mode)...")
+                _reader = easyocr.Reader(['en'], gpu=False)
+    return _reader
+
+
+def run_ocr(image_path: str) -> list:
+    """Thread-safe execution of OCR reader with tuned parameters for dense spec sheets."""
+    reader = get_ocr_reader()
+    with _ocr_lock:
+        return reader.readtext(
+            image_path,
+            paragraph=False,
+            detail=1,
+            width_ths=0.6,
+            height_ths=0.6,
+            text_threshold=0.45,
+            low_text=0.35,
+            link_threshold=0.3,
+            mag_ratio=1.5,
+            slope_ths=0.2,
+        )
+
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+#  NORMALIZATIONS & MAPPINGS
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+def normalize_item_size(size_str: str) -> str:
+    if not size_str:
+        return ""
+        
+    s = size_str.upper().strip()
+    
+    # Normalize common typo EUS9 -> EU59
+    s = s.replace("EUS9", "EU59")
+    
+    m_us = re.search(r'US[-.\s]*(\d+(?:\.\d+)?)', s, re.IGNORECASE)
+    m_eu = re.search(r'EU[-.\s]*(\d+)', s, re.IGNORECASE)
+    m_uk = re.search(r'UK[-.\s]*([A-Z](?:\s*\d/\d)?)', s, re.IGNORECASE)
+    m_in = re.search(r'\bIN[-.\s]*(\d+(?:\.\d+)?)', s, re.IGNORECASE)
+    
+    if m_eu:
+        return f"EU {m_eu.group(1)}"
+    elif m_us:
+        return f"US {m_us.group(1)}"
+    elif m_uk:
+        uk_val = m_uk.group(1).replace(" ", "")
+        return f"UK {uk_val}"
+    elif m_in:
+        return f"IN {m_in.group(1)}"
+        
+    # Check if it is a plain number
+    m_num = re.match(r'^(\d+(?:\.\d+)?)$', s)
+    if m_num:
+        return f"EU {m_num.group(1)}"
+        
+    # Fallback search if prefix is anywhere
+    for prefix in ["EU", "US", "UK", "IN"]:
+        if prefix in s:
+            val = s.replace(prefix, "").replace("-", "").replace(".", "").strip()
+            if val:
+                return f"{prefix} {val}"
+                
+    return size_str
+
+
+def clean_stone_size(size_str: str) -> str:
+    if not size_str:
+        return ""
+    # Standardize dimensions to lowercase x and strip spaces
+    s = str(size_str).strip()
+    s = s.replace("*", "x").replace("X", "x").replace(" ", "")
+    return s
+
+
+def align_style_code_with_size(style_code: str, item_size: str) -> str:
+    if not style_code or not item_size:
+        return style_code
+        
+    # Extract size type and value
+    m_us = re.search(r'US[-.\s]*(\d+(?:\.\d+)?)', item_size, re.IGNORECASE)
+    m_eu = re.search(r'EU[-.\s]*(\d+)', item_size, re.IGNORECASE)
+    m_uk = re.search(r'UK[-.\s]*([A-Z](?:\s*\d/\d)?)', item_size, re.IGNORECASE)
+    
+    if m_us:
+        size_type = "US"
+        size_val = m_us.group(1)
+    elif m_eu:
+        size_type = "EU"
+        size_val = m_eu.group(1)
+    elif m_uk:
+        size_type = "UK"
+        size_val = m_uk.group(1).replace(" ", "")
+    else:
+        return style_code
+
+    # Check if style code already contains this size type (e.g. -US, -EU, -UK)
+    size_pattern = rf'-{size_type}[-.\s]*(\d+(?:\.\d+)?|[A-Z](?:\d/\d)?)'
+    m_style = re.search(size_pattern, style_code, re.IGNORECASE)
+    
+    if m_style:
+        val_in_style = m_style.group(1)
+        if val_in_style != size_val:
+            start, end = m_style.span(1)
+            style_code = style_code[:start] + size_val + style_code[end:]
+    else:
+        if not style_code.endswith(f"-{size_val}"):
+            style_code = f"{style_code}-{size_type}{size_val}"
+            
+    return style_code
+
+
+def map_category_code(cat_str: str) -> str:
+    if not cat_str:
+        return "EJR"
+    c = cat_str.upper().strip()
+    
+    # Gati official category codes (from system screenshot)
+    ej_map = {
+        # Rings
+        "EJR": "EJR", "R": "EJR", "RING": "EJR", "RINGS": "EJR",
+        # Earrings
+        "EJE": "EJE", "E": "EJE", "EARRING": "EJE", "EARRINGS": "EJE",
+        # Pendants
+        "EJP": "EJP", "P": "EJP", "PENDANT": "EJP", "PENDANTS": "EJP",
+        # Bracelets
+        "EJB": "EJB", "B": "EJB", "BRACELET": "EJB", "BRACELETS": "EJB",
+        # Necklace Pendants
+        "EJY": "EJY", "Y": "EJY", "NECKLACE PENDANT": "EJY", "NECKLACE PENDANTS": "EJY",
+        # Necklaces
+        "EJN": "EJN", "N": "EJN", "NECKLACE": "EJN", "NECKLACES": "EJN",
+        # Nose Rings
+        "EJZ": "EJZ", "Z": "EJZ", "NOSE RING": "EJZ", "NOSE RINGS": "EJZ",
+        # Cufflinks
+        "EJC": "EJC", "C": "EJC", "CUFFLINK": "EJC", "CUFFLINKS": "EJC",
+        # Broches
+        "EJM": "EJM", "M": "EJM", "BROCH": "EJM", "BROCHE": "EJM", "BROCHES": "EJM",
+        # Bangles
+        "EJX": "EJX", "X": "EJX", "BANGLE": "EJX", "BANGLES": "EJX",
+        # Chains
+        "CH": "CH", "CHAIN": "CH", "CHAINS": "CH"
+    }
+    
+    if c in ej_map:
+        return ej_map[c]
+        
+    if "NECKLACE PENDANT" in c:
+        return "EJY"
+    if "RING" in c:
+        return "EJR"
+    if "EAR" in c:
+        return "EJE"
+    if "PEND" in c:
+        return "EJP"
+    if "BRAC" in c:
+        return "EJB"
+    if "BANG" in c or "BX" in c:
+        return "EJX"
+    if "NECK" in c:
+        return "EJN"
+    if "NOSE" in c:
+        return "EJZ"
+    if "CUFF" in c:
+        return "EJC"
+    if "BROCH" in c:
+        return "EJM"
+    if "CHAIN" in c:
+        return "CH"
+    return "EJR"
+
+
+def clean_mfg_code(mfg_str: str) -> str:
+    if not mfg_str:
+        return "EVERMORE JEWELLERY PRIVATE LIMITED"
+    m = mfg_str.upper().strip()
+    if "EVERMORE" in m or "RJ595" in m:
+        return "EVERMORE JEWELLERY PRIVATE LIMITED"
+    return mfg_str
+
+
+def clean_stock_type(stock_str: str) -> str:
+    if not stock_str:
+        return "NATURAL DIAMOND JEWELRY"
+    s = stock_str.upper().strip()
+    if "CUSTOMER" in s or "ORDER" in s:
+        return "CUSTOMER ORDER"
+    if "RUF" in s or "QUOT" in s:
+        return "RUF QUOTATION"
+    if "LAB" in s:
+        return "LAB DIAMOND JEWELRY"
+    if "CZ" in s:
+        return "CZ JEWELRY"
+    if "PLAIN" in s:
+        return "PLAIN JEWELRY"
+    if "GEM" in s:
+        return "GEM STONE"
+    if "SAMPLE" in s:
+        return "SAMPLE JEWELRY"
+    if "POLKI" in s:
+        return "POLKI STONE"
+    if "PEARL" in s:
+        return "NATURAL PEARL"
+    if "NONE" in s:
+        return "None"
+    return "NATURAL DIAMOND JEWELRY"
+
+
+def map_metal_item_code(metal_str: str) -> str:
+    if not metal_str:
+        return "G14KT"
+    m = metal_str.upper().replace(" ", "")
+    if "PT" in m or "950" in m:
+        return "PT950"
+    karat = "14"
+    if "18" in m:
+        karat = "18"
+    elif "9" in m:
+        karat = "9"
+        
+    color_suffix = ""
+    if "WHITE" in m or "WG" in m or m.endswith("W"):
+        color_suffix = "W"
+    elif "YELLOW" in m or "YG" in m or m.endswith("Y"):
+        color_suffix = "Y"
+    elif "ROSE" in m or "RG" in m or "PINK" in m or m.endswith("R"):
+        color_suffix = "R"
+        
+    return f"G{karat}KT{color_suffix}"
+
+
+def map_stone_position(pos_str: str) -> str:
+    if not pos_str:
+        return "None"
+    p = pos_str.upper().strip()
+    if "CENTER" in p or "MAIN" in p:
+        return "Center Stone"
+    return "None"
+
+
+def map_setting_type(setting_str: str) -> str:
+    if not setting_str:
+        return "PRONG"
+    s = str(setting_str).upper().strip()
+    
+    # Map setting names and typos to correct Gati Setting Code
+    setting_map = {
+        "MICRO PAVE(U WITH SPLIT)": "MICRO PAVE(U)",
+        "MICRO PAVE (U WITH SPLIT)": "MICRO PAVE(U)",
+        "MICRO PAVE U WITH SPLIT": "MICRO PAVE(U)",
+        "MICRO PAVE(U WITH SPLIT) SETTING": "MICRO PAVE(U)",
+        "PLATE PTONG": "PLATE PRONG",
+        "PLATE PTONG SETTING": "PLATE PRONG",
+        "DOUBLE CLAW PRONG": "DOUBLE CLOW PRONG",
+    }
+    
+    if s in setting_map:
+        return setting_map[s]
+        
+    valid_codes = {
+        "PRONG", "PAVE", "BEZEL", "MICRO PAVE", "CLAW PRONG", "V PRONG", "SHARED PRONG",
+        "HALF BEZEL", "NICK", "CHANNEL", "BAR", "FLUSH", "FRENCH PAVE", "PRESSURE",
+        "ILLUSION", "INVISIBLE", "CHANNEL-PRONG", "BEAD", "SCALLOP", "SURFACE PRONG",
+        "FISHTAIL SETTING", "MICRO PAVE(U)", "TIGER SET", "PLATE PRONG", "TIGER PRONG",
+        "HALF CHANNEL", "TULIP PRONG", "DOUBLE CLOW PRONG", "SPLIT PRONG", "FRENCH CUT",
+        "WALL", "PRONG & WALL", "PRONGS & CHANNEL", "CLAW + HALF BEZEL", "TENSION SETTING"
+    }
+    
+    if s in valid_codes:
+        return s
+        
+    # 2. String matching rules
+    if "MICRO PAVE(U)" in s or "MICRO PAVE (U)" in s or "MICRO PAVE U" in s or "WITH SPLIT" in s:
+        return "MICRO PAVE(U)"
+    if "MICRO" in s:
+        return "MICRO PAVE"
+    if "FRENCH PAVE" in s or ("FRENCH" in s and "PAVE" in s):
+        return "FRENCH PAVE"
+    if "FRENCH" in s:
+        return "FRENCH CUT"
+    if "CLAW + HALF BEZEL" in s or "CLAW+HALF" in s:
+        return "CLAW + HALF BEZEL"
+    if "CLAW" in s or "CLOW" in s:
+        if "DOUBLE" in s:
+            return "DOUBLE CLOW PRONG"
+        return "CLAW PRONG"
+    if "SHARED" in s:
+        return "SHARED PRONG"
+    if "SURFACE" in s:
+        return "SURFACE PRONG"
+    if "TIGER" in s:
+        if "PRONG" in s:
+            return "TIGER PRONG"
+        return "TIGER SET"
+    if "PLATE" in s or "PTONG" in s:
+        return "PLATE PRONG"
+    if "TULIP" in s:
+        return "TULIP PRONG"
+    if "SPLIT" in s:
+        return "SPLIT PRONG"
+    if "FISHTAIL" in s:
+        return "FISHTAIL SETTING"
+    if "TENSION" in s:
+        return "TENSION SETTING"
+    if "HALF" in s:
+        if "CHANNEL" in s:
+            return "HALF CHANNEL"
+        if "BEZEL" in s:
+            return "HALF BEZEL"
+    if "PRONG & WALL" in s or "PRONG AND WALL" in s or "PRONG&WALL" in s:
+        return "PRONG & WALL"
+    if "PRONGS & CHANNEL" in s or "PRONG AND CHANNEL" in s or "PRONGS&CHANNEL" in s:
+        return "PRONGS & CHANNEL"
+    if "CHANNEL-PRONG" in s or "CHANNEL PRONG" in s:
+        return "CHANNEL-PRONG"
+    if "V" in s and "PRONG" in s:
+        return "V PRONG"
+        
+    # Standard fallback checks
+    for code in ["PAVE", "BEZEL", "CHANNEL", "FLUSH", "NICK", "BAR", "PRESSURE", "ILLUSION", "INVISIBLE", "BEAD", "SCALLOP", "WALL", "PRONG"]:
+        if code in s:
+            return code
+            
+    return "PRONG"
+
+
+# Strict allowlist of known stone type keywords.
+# Any OCR-extracted text that does NOT contain at least one of these is
+# treated as a false-positive and skipped from the diamond table.
+_STONE_TYPE_KEYWORDS = {
+    # Diamond variants
+    "DIAMOND", "DIAM", "DIA",
+    # Colored stones
+    "RUBY", "SAPPHIRE", "EMERALD", "TOPAZ", "AMETHYST", "GARNET",
+    "TANZANITE", "AQUAMARINE", "PERIDOT", "TURQUOISE", "CITRINE",
+    "ALEXANDRITE", "CABOCHON", "APATITE", "MOISSANITE",
+    # Common abbreviations used on spec sheets
+    "DRD", "DMQ", "DPE", "DOV", "DEM", "DCU", "DPR", "DHR", "DAC", "DRA", "DTR", "DBG",
+    "LDRD", "LDMQ",
+    "CSRD", "CSMQ", "CSPE", "CSOV", "CSCU", "CSEM",
+}
+
+def is_valid_stone_type(gem_type_str: str) -> bool:
+    """Returns True only if the text looks like a real stone type on a spec sheet.
+    
+    This prevents OCR noise (notes, measurements, labels) from being
+    misinterpreted as colored-stone rows.
+    """
+    if not gem_type_str:
+        return False
+    g = gem_type_str.upper().strip()
+    # Must be at least 1 character and contain a letter
+    if len(g) < 1 or not any(c.isalpha() for c in g):
+        return False
+    # Check strict keyword allowlist
+    for kw in _STONE_TYPE_KEYWORDS:
+        if kw in g:
+            return True
+    # Reject anything that is purely numbers or single chars that are not "D"
+    if re.match(r'^[\d.\s\-x\*]+$', g):
+        return False
+    if len(g) <= 2 and g not in {"D", "RB", "EM", "TN", "AQ"}:
+        return False
+    return False  # Default-deny: anything not explicitly recognized is skipped
+
+
+def map_gem_item_code(gem_type_str: str, shape_str: str = "", stock_type_str: str = "NATURAL DIAMOND JEWELRY") -> str | None:
+    """Maps a gem type and shape to a Gati item code.
+    
+    Returns None if the gem_type is not a recognized stone type,
+    signaling the caller to skip this row.
+    """
+    if not gem_type_str:
+        return None
+        
+    g = gem_type_str.upper().strip()
+    sh = shape_str.upper().strip()
+    st = stock_type_str.upper().strip() if stock_type_str else ""
+
+    # Determine Shape Code from shape column
+    shape_code = "RD"  # default round
+    if "ROUND" in sh or "RD" in sh:   shape_code = "RD"
+    elif "PEAR" in sh or "PE" in sh:   shape_code = "PE"
+    elif "OVAL" in sh or "OV" in sh:   shape_code = "OV"
+    elif "MARQUISE" in sh or "MQ" in sh: shape_code = "MQ"
+    elif "EMERALD" in sh or "EM" in sh: shape_code = "EM"
+    elif "CUSHION" in sh or "CU" in sh: shape_code = "CU"
+    elif "PRINCESS" in sh or "PR" in sh: shape_code = "PR"
+    elif "HEART" in sh or "HR" in sh:  shape_code = "HR"
+    elif "ASSCHER" in sh or "AC" in sh: shape_code = "AC"
+    elif "RADIANT" in sh or "RA" in sh: shape_code = "RA"
+    elif "TRILLION" in sh or "TR" in sh: shape_code = "TR"
+    elif "BAGUETTE" in sh or "BG" in sh: shape_code = "BG"
+    elif "ELONGATED CUSHION" in sh:   shape_code = "EC"
+    elif "KITE" in sh or "KS" in sh:   shape_code = "KS"
+
+    # Also try to derive shape from gem_type string if shape col is empty
+    if not sh:
+        for code, keywords in [("RD", ["ROUND","RD"]), ("PE", ["PEAR","PE"]),
+                               ("OV", ["OVAL","OV"]), ("MQ", ["MARQUISE","MQ"]),
+                               ("EM", ["EMERALD","EM"]), ("CU", ["CUSHION","CU"]),
+                               ("PR", ["PRINCESS","PR"]), ("HR", ["HEART","HR"]),
+                               ("RA", ["RADIANT","RA"]), ("TR", ["TRILLION","TR"]),
+                               ("BG", ["BAGUETTE","BG"])]:
+            if any(k in g for k in keywords):
+                shape_code = code
+                break
+
+    # 1. Diamond â€” must contain DIAMOND keyword or known diamond prefixes
+    if "DIAMOND" in g or "DIAM" in g or "DIA" in g:
+        is_lab = "LAB" in st or "LAB" in g
+        prefix = "LD" if is_lab else "D"
+        return f"{prefix}{shape_code}"
+    
+    # 2. Already-coded item codes (e.g. DRD, CSRDEM entered directly)
+    known_prefixes = ("DRD","DMQ","DPE","DOV","DEM","DCU","DPR","DHR","DAC","DRA","DTR","DBG",
+                      "LDRD","LDMQ","CSRD","CSMQ","CSPE","CSOV","CSCU")
+    if any(g.startswith(pfx) for pfx in known_prefixes):
+        return g  # already a valid code â€” pass through unchanged
+
+    # 3. Colored Stone Mappings â€” only if a known CS keyword is present
+    gem_suffix = None
+    if "RUBY" in g or g == "RB":                          gem_suffix = "RB"
+    elif "PINK SAPPHIRE" in g or "PNSP" in g:             gem_suffix = "PNSP"
+    elif "BLUE SAPPHIRE" in g or "BLSP" in g:             gem_suffix = "BLSP"
+    elif "YELLOW SAPPHIRE" in g or "YLSP" in g:           gem_suffix = "YLSP"
+    elif "SAPPHIRE" in g:                                  gem_suffix = "BLSP"
+    elif "AQUAMARINE" in g or g == "AQ":                  gem_suffix = "AQ"
+    elif "TANZANITE" in g or g == "TN":                   gem_suffix = "TN"
+    elif "BLUE TOPAZ" in g or "BLTPZ" in g:               gem_suffix = "BLTPZ"
+    elif "TOPAZ" in g or g == "TPZ":                      gem_suffix = "TPZ"
+    elif "TURQUOISE" in g or g == "TQ":                   gem_suffix = "TQ"
+    elif "GARNET" in g or g == "GAR":                     gem_suffix = "GAR"
+    elif "PERIDOT" in g or g == "PER":                    gem_suffix = "PER"
+    elif "ALEXANDRITE" in g or g == "ALD":                gem_suffix = "ALD"
+    elif "CITRINE" in g or g == "CIT":                    gem_suffix = "CIT"
+    elif "CABOCHON" in g or g == "CAB":                   gem_suffix = "CAB"
+    elif "AMETHYST" in g or g == "AM":                    gem_suffix = "AM"
+    elif "NEON APATITE" in g or "APATITE" in g:           gem_suffix = "NAP"
+    elif "MOISSANITE" in g or g == "MO":                  gem_suffix = "MO"
+    elif "EMERALD" in g or g == "EM":                     gem_suffix = "EM"
+    elif "DARK GREEN" in g or "LIGHT GREEN" in g or "GREEN" in g: gem_suffix = "EM"
+    elif "BLACK" in g or g == "BLK":                      gem_suffix = "BLK"
+
+    if gem_suffix is not None:
+        return f"CS{shape_code}{gem_suffix}"
+
+    # 4. Not a recognized stone type â€” return None so the caller can skip this row
+    logger.debug(f"Skipping unrecognized gem_type from OCR: '{gem_type_str}'")
+    return None
+
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+#  CORE OCR EXTRACTION
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+def extract_style_data_from_image(fpath: Path) -> dict:
+    """Extracts design and stone details from a spec sheet image using OCR."""
+    logger.info(f"Extracting details from: {fpath.name}")
+    
+    # 1. Preprocess Image â€” 3Ã— upscale + sharpen + auto-level + binarize
+    temp_path = fpath.parent / f"temp_ocr_{uuid.uuid4().hex[:8]}.png"
+    try:
+        with Image.open(fpath) as img:
+            img_w, img_h = img.size
+
+            # Scale up 3Ã— for small text â€” biggest single quality win
+            target_w = img_w * 3
+            target_h = img_h * 3
+            img_large = img.resize((target_w, target_h), Image.Resampling.LANCZOS)
+
+            # Convert to greyscale
+            img_gray = img_large.convert('L')
+
+            # Auto-level (stretch histogram to 0-255)
+            img_leveled = ImageOps.autocontrast(img_gray, cutoff=1)
+
+            # Sharpen to make thin table lines and small digits crisper
+            img_sharp = img_leveled.filter(ImageFilter.SHARPEN)
+            img_sharp = img_sharp.filter(ImageFilter.SHARPEN)  # double-sharpen
+
+            # Contrast boost
+            enhancer = ImageEnhance.Contrast(img_sharp)
+            img_enhanced = enhancer.enhance(2.2)
+
+            # Slight sharpness boost on top
+            enhancer2 = ImageEnhance.Sharpness(img_enhanced)
+            img_final = enhancer2.enhance(2.0)
+
+            img_final.save(temp_path, dpi=(300, 300))
+    except Exception as e:
+        logger.error(f"Image preprocessing failed: {e}")
+        raise
+        
+    try:
+        ocr_results = run_ocr(str(temp_path))
+    except Exception as e:
+        logger.error(f"OCR execution failed: {e}")
+        raise
+    finally:
+        if temp_path.exists():
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+                
+    # Helper to parse stone weights
+    def parse_weight(val_str):
+        if not val_str:
+            return 0.0
+        val_str = val_str.strip()
+        val_str = "".join([c for c in val_str if c.isdigit() or c == "."])
+        if not val_str:
+            return 0.0
+        if "." not in val_str:
+            try:
+                val = float(val_str)
+                return val / 1000.0
+            except ValueError:
+                return 0.0
+        else:
+            if val_str.startswith("."):
+                val_str = "0" + val_str
+            try:
+                return float(val_str)
+            except ValueError:
+                return 0.0
+
+    # Helper to parse metal weights
+    def parse_metal_weight(val_str):
+        if not val_str:
+            return 0.0
+        val_str = val_str.strip().replace(" ", "")
+        cleaned = "".join([c for c in val_str if c.isdigit() or c == "."])
+        if not cleaned:
+            return 0.0
+        try:
+            val = float(cleaned)
+            if 0.5 <= val <= 30.0:
+                return val
+            if "." not in cleaned:
+                if 50 <= val <= 3000:
+                    return val / 100.0
+                elif val > 3000:
+                    return val / 1000.0
+            return val
+        except ValueError:
+            return 0.0
+
+    # Helper to clean style code OCR typos
+    def clean_style_code(code_str):
+        if not code_str:
+            return code_str
+        code_str = code_str.replace("o", "0").replace("O", "0").replace("_", "-")
+        code_str = code_str.strip("-").strip(".").strip()
+        return code_str.upper()
+
+    # Normalize extracted coordinates (preprocessing scaled 3Ã—)
+    SCALE = 3.0
+    items = []
+    for bbox, text, conf in ocr_results:
+        xs = [pt[0] / SCALE for pt in bbox]
+        ys = [pt[1] / SCALE for pt in bbox]
+        cx = sum(xs) / 4.0
+        cy = sum(ys) / 4.0
+        h_val = max(ys) - min(ys)
+        w_val = max(xs) - min(xs)
+        items.append({
+            "text": text.strip(),
+            "cx": cx,
+            "cy": cy,
+            "h": h_val,
+            "w": w_val
+        })
+        
+    # â”€â”€ OCR character-level cleanup helper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    def clean_ocr_text(t: str) -> str:
+        """Fix common OCR character confusions in text from spec sheets."""
+        # Common digit/letter swaps in OCR output
+        t = t.replace('\u2014', '-').replace('\u2013', '-').replace('\u2019', "'")
+        # In numeric contexts: lâ†’1, Oâ†’0, oâ†’0, Iâ†’1, Sâ†’5 (handled per-field below)
+        return t.strip()
+
+    # Re-apply clean_ocr_text on every item text
+    for it in items:
+        it['text'] = clean_ocr_text(it['text'])
+
+    # Use original scale since cx/cy are normalized back by dividing by SCALE
+    width_threshold = img_w * 0.68
+    left_items  = [x for x in items if x['cx'] < width_threshold]
+    right_items = [x for x in items if x['cx'] >= width_threshold]
+    
+    # Group items into rows
+    left_items.sort(key=lambda x: x['cy'])
+    left_rows = []
+    for item in left_items:
+        placed = False
+        for r in left_rows:
+            avg_cy = sum(x['cy'] for x in r) / len(r)
+            if abs(item['cy'] - avg_cy) < 8:  # 8px tolerance (finely tuned to prevent row-bleeding at 1x scale)
+                r.append(item)
+                placed = True
+                break
+        if not placed:
+            left_rows.append([item])
+            
+    for r in left_rows:
+        r.sort(key=lambda x: x['cx'])
+        
+    # â”€â”€ EJ Design No extraction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Pattern covers formats used by Evermore:
+    #   R02957-V1-OV0200   (Ring)
+    #   E07788-RD0060      (Earring)
+    #   P01234-AB1234      (Pendant)
+    # Also handles OCR typos: 0â†”O already cleaned by clean_style_code
+    EJ_DESIGN_PATTERN = re.compile(
+        r'\b([REPBN]\d{4,6}(?:-[A-Z0-9]{1,8}){1,4})\b',
+        re.IGNORECASE
+    )
+    # Fallback: also match style codes between pipe characters |...| (common CAD format)
+    # e.g. "| R07496-PE0100-EU50 |" or "EJ Design no : | R07496-PE0100-EU50 |"
+    PIPE_STYLE_PATTERN = re.compile(
+        r'\|\s*([A-Z0-9]+(?:-[A-Z0-9]+){1,4})\s*\|',
+        re.IGNORECASE
+    )
+
+    filename = fpath.name
+    style_code = "UNKNOWN"
+    item_size = ""
+    cad_type_label = ""   # e.g. "EARRING", "RING", "PENDANT", "BANGLE"
+    
+    base = os.path.splitext(filename)[0]
+    base = base.split("@")[0]
+    base = base.split("__")[0]
+    base = re.sub(r'_[a-f0-9]{4}
+    # Match EJ design codes: R/E/X prefix followed by digits (e.g. R02957-V1-OV0200, E07788-RD0060)
+    if re.match(r'^[REPBN]\d{4,5}', base, re.IGNORECASE):
+        style_code = base.upper()
+
+    # â”€â”€ Detect CAD type label (EARRING / RING / PENDANT etc.) from all OCR items â”€â”€
+    TYPE_LABELS = {
+        "EARRING": "EARRING",
+        "EARRINGS": "EARRING",
+        "PENDANT": "PENDANT",
+        "PENDANTS": "PENDANT",
+        "BANGLE": "BANGLE",
+        "BANGLES": "BANGLE",
+        "BRACELET": "BRACELET",
+        "NECKLACE": "NECKLACE",
+        "RING": "RING",
+        "RINGS": "RING",
+        "BROOCH": "BROOCH",
+    }
+    for item in items:
+        word = item['text'].strip().upper()
+        if word in TYPE_LABELS:
+            cad_type_label = TYPE_LABELS[word]
+            break
+
+    # â”€â”€ Item size: only meaningful for rings; skip for earrings/pendants etc. â”€â”€
+    RING_TYPES = {"RING", ""}   # empty means unknown â€” try to extract
+    if cad_type_label in RING_TYPES:
+        for r in left_rows:
+            row_texts = [x['text'] for x in r]
+            joined = " ".join(row_texts).lower()
+            if "size" in joined:
+                for t in row_texts:
+                    if any(p in t.upper() for p in ["EU-", "UK.", "US.", "EU", "UK", "US"]):
+                        item_size = t
+                        break
+                if item_size:
+                    break
+        item_size = normalize_item_size(item_size)
+    # For earrings, pendants, bangles etc. item_size stays empty
+    
+    # Fallback OCR for style code â€” also catches E-prefix codes
+    # Scan every OCR item for a valid EJ Design No
+    if style_code == "UNKNOWN":
+        for item in items:
+            t_clean = clean_style_code(item['text'])
+            m = EJ_DESIGN_PATTERN.search(t_clean)
+            if m:
+                candidate = m.group(1).upper()
+                # Must have at least one dash (ignore single-segment false positives)
+                if '-' in candidate:
+                    style_code = candidate
+                    logger.info(f"Style code found via OCR scan: {style_code}")
+                    break
+                    
+    # Parse Diamonds Table
+    diamonds = []
+    header_pcts = {
+        "GemType": 49.0 / 1600.0,
+        "Location": 184.0 / 1600.0,
+        "Shape": 322.0 / 1600.0,
+        "Size": 439.0 / 1600.0,
+        "Sieve": 566.0 / 1600.0,
+        "Dwt": 692.0 / 1600.0,
+        "Qty": 791.0 / 1600.0,
+        "Twt": 895.0 / 1600.0,
+        "Setting": 1045.0 / 1600.0
+    }
+    header_cx = {k: pct * img_w for k, pct in header_pcts.items()}
+    
+    header_row_found = False
+    start_table_idx = 0
+    for idx, r in enumerate(left_rows):
+        joined = " ".join([x['text'] for x in r]).lower()
+        joined_clean = joined.replace("_", "").replace("-", "").replace(" ", "")
+        if "gem" in joined_clean and "setting" in joined_clean:
+            header_row_found = True
+            start_table_idx = idx
+            break
+            
+    SKIP_KEYWORDS = {"gem type", "setting type", "total", "note", "diamond details",
+                     "size", "shape", "sieve", "qty", "twt", "dwt", "location"}
+
+    if header_row_found:
+        # Dynamically align expected column coordinates using the matched header row
+        header_row = left_rows[start_table_idx]
+        for item in header_row:
+            t_clean = item['text'].lower().replace("_", "").replace("-", "").strip()
+            target_key = None
+            if "gem" in t_clean:
+                target_key = "GemType"
+            elif "location" in t_clean:
+                target_key = "Location"
+            elif "shape" in t_clean:
+                target_key = "Shape"
+            elif "sieve" in t_clean:
+                target_key = "Sieve"
+            elif "size" in t_clean:
+                target_key = "Size"
+            elif "qty" in t_clean or "pcs" in t_clean or "quantity" in t_clean:
+                target_key = "Qty"
+            elif "wt" in t_clean or "weight" in t_clean or "dwt" in t_clean:
+                if "total" in t_clean or "twt" in t_clean or "t.wt" in t_clean:
+                    target_key = "Twt"
+                else:
+                    target_key = "Dwt"
+            elif "setting" in t_clean:
+                target_key = "Setting"
+                
+            if target_key:
+                header_cx[target_key] = item['cx']
+                logger.info(f"Dynamically aligned header column '{item['text']}' -> '{target_key}' at cx={item['cx']:.1f}")
+
+        for idx in range(start_table_idx + 1, len(left_rows)):
+            r = left_rows[idx]
+            row_texts = [x['text'] for x in r]
+            if not row_texts:
+                continue
+            first_text = row_texts[0].strip().lower()
+            if not first_text or first_text == "-" or first_text in SKIP_KEYWORDS:
+                continue
+            if "total" in first_text:
+                break
+            if all(t.strip() in ("-", "", ".") for t in row_texts):
+                continue
+
+            col_data_lists = {k: [] for k in header_cx.keys()}
+            for item in r:
+                closest_key = min(header_cx.keys(), key=lambda k: abs(item['cx'] - header_cx[k]))
+                col_data_lists[closest_key].append(item)
+            
+            col_data = {}
+            for k, items_list in col_data_lists.items():
+                items_list.sort(key=lambda x: x['cx'])
+                col_data[k] = " ".join([x['text'] for x in items_list]).strip()
+
+            gem_type = col_data.get("GemType", "").strip()
+            shape    = col_data.get("Shape",   "").strip()
+            
+            # Skip empty, placeholder, or unrecognized gem types
+            if not gem_type or gem_type == "-":
+                continue
+            
+            # Validate this is actually a stone type before processing
+            item_code_check = map_gem_item_code(gem_type, shape)
+            if item_code_check is None:
+                logger.debug(f"Skipping OCR row with unrecognized gem_type='{gem_type}' (likely noise).")
+                continue
+
+            pcs = 0
+            qty_str = col_data["Qty"]
+            if qty_str and re.match(r'^\d+$', qty_str.strip()):
+                pcs = int(qty_str)
+
+            wt  = parse_weight(col_data["Twt"])
+            dwt = parse_weight(col_data["Dwt"])
+
+            if pcs == 0 and wt > 0 and dwt > 0:
+                pcs = int(round(wt / dwt))
+
+            sz = col_data["Size"]
+            if not sz and dwt > 0:
+                if abs(dwt - 0.003) < 0.0005: sz = "0.80MM"
+                elif abs(dwt - 0.004) < 0.0005: sz = "0.90MM"
+                elif abs(dwt - 0.005) < 0.0005: sz = "1.00MM"
+                elif abs(dwt - 0.014) < 0.002:  sz = "1.50MM"
+                elif abs(dwt - 0.022) < 0.002:  sz = "1.70MM"
+
+            st = col_data["Setting"]
+            if not st:
+                st = "Prong Set"
+            if st.endswith("_"):
+                st = st[:-1]
+
+            item_code = item_code_check  # already computed and validated above
+            location = col_data.get("Location", "").strip()
+            stone_pos = map_stone_position(location) if location and location != "-" else "None"
+
+            diamonds.append({
+                "ItemCode": item_code,
+                "GemType": gem_type,
+                "Shape": shape,
+                "Size": sz if sz else col_data.get("Size", "1.00MM"),
+                "Pcs": pcs,
+                "Weight": wt,
+                "StonePosition": stone_pos,
+                "SettingType": st
+            })
+
+    if not diamonds:
+        diamonds.append({
+            "ItemCode": "DRD",
+            "GemType": "Diamond",
+            "Shape": "Round",
+            "Size": "1.00MM",
+            "Pcs": 1,
+            "Weight": 0.01,
+            "StonePosition": "None",
+            "SettingType": "Prong Set"
+        })
+        
+    # Parse Metal details
+    metal_candidates = []
+    metal_terms = ["9K", "14K", "18K", "PT950", "G14K", "G18K", "9KT", "14KT", "18KT"]
+    for item in right_items:
+        text_clean = item['text'].replace(" ", "").upper().replace("9R", "9K").replace("14R", "14K").replace("18R", "18K")
+        is_metal = False
+        matched_term = ""
+        for term in metal_terms:
+            if term in text_clean:
+                is_metal = True
+                matched_term = term
+                break
+        if is_metal:
+            orig = item['text'].upper().replace("9R", "9K").replace("14R", "14K").replace("18R", "18K")
+            norm_metal = "9K WG"
+            for m_code in ["9K WG", "14K WG", "18K WG", "PT950", "G14KTW", "G18KTW", "14K YG", "18K YG", "9K YG", "14K RG", "18K RG", "9K RG"]:
+                if m_code.replace(" ", "") in orig.replace(" ", ""):
+                    norm_metal = m_code
+                    break
+            else:
+                norm_metal = matched_term + " WG"
+                
+            row_candidates = []
+            for other in right_items:
+                if other == item:
+                    continue
+                if abs(other['cy'] - item['cy']) < 15 and other['cx'] > item['cx']:
+                    row_candidates.append(other)
+            row_candidates.sort(key=lambda o: (abs(o['cy'] - item['cy']), o['cx'] - item['cx']))
+            
+            parsed_wt = 0.0
+            for cand in row_candidates:
+                wt_val = parse_metal_weight(cand['text'])
+                if wt_val > 0.0:
+                    parsed_wt = wt_val
+                    break
+            metal_candidates.append({
+                "metal": norm_metal,
+                "weight": parsed_wt,
+                "cy": item['cy']
+            })
+            
+    total_gold_y = -1
+    for item in right_items:
+        if "total gold weight" in item['text'].lower() or "gold weight" in item['text'].lower():
+            total_gold_y = item['cy']
+            break
+            
+    best_metal = "9K WG"
+    best_weight = 0.0
+    if metal_candidates:
+        if total_gold_y != -1:
+            metal_candidates.sort(key=lambda c: abs(c['cy'] - total_gold_y))
+            best_metal = metal_candidates[0]['metal']
+            best_weight = metal_candidates[0]['weight']
+        else:
+            metal_candidates.sort(key=lambda c: c['weight'], reverse=True)
+            best_metal = metal_candidates[0]['metal']
+            best_weight = metal_candidates[0]['weight']
+            
+    # â”€â”€ Style code: strip size suffix that was auto-appended for non-ring types â”€â”€
+    if style_code != "UNKNOWN":
+        # Only align (append size) for ring-type items
+        if cad_type_label in RING_TYPES and item_size:
+            aligned_style_code = align_style_code_with_size(style_code, item_size)
+        else:
+            # For earrings/pendants just clean the code as-is
+            aligned_style_code = style_code.upper()
+    else:
+        aligned_style_code = "STYLE-LOCAL"
+
+    # â”€â”€ Parent Style: First 5-6 characters or first segment before first dash â”€â”€
+    parent_style = ""
+    if aligned_style_code and aligned_style_code != "STYLE-LOCAL":
+        if "-" in aligned_style_code:
+            parent_style = aligned_style_code.split("-")[0].strip()
+        else:
+            m_parent = re.match(r'^([A-Z]\d{4,5})', aligned_style_code, re.IGNORECASE)
+            if m_parent:
+                parent_style = m_parent.group(1).upper()
+            else:
+                parent_style = aligned_style_code[:6].upper()
+        # Clean trailing dashes/underscores from Parent Style
+        parent_style = parent_style.strip("-_").strip()
+
+    # â”€â”€ Determine SubCategory from detected type label â”€â”€
+    SUB_CATEGORY_MAP = {
+        "RING":     "",
+        "EARRING":  "",
+        "PENDANT":  "",
+        "BANGLE":   "",
+        "BRACELET": "",
+        "NECKLACE": "",
+        "BROOCH":   "",
+        "": "",
+    }
+    sub_category = SUB_CATEGORY_MAP.get(cad_type_label, "")
+
+    # â”€â”€ Category from type label â”€â”€
+    CATEGORY_MAP = {
+        "RING":     "EJR",
+        "EARRING":  "EJE",
+        "PENDANT":  "EJP",
+        "BANGLE":   "EJB",
+        "BRACELET": "EJBR",
+        "NECKLACE": "EJN",
+        "BROOCH":   "EJBR",
+        "": "EJR",
+    }
+    category = CATEGORY_MAP.get(cad_type_label, "EJR")
+
+    extracted_data = {
+        "StyleCode": aligned_style_code,
+        "StyleDate": str(date.today()),
+        "Category": category,
+        "SubCategory": sub_category,
+        "StockType": "NATURAL DIAMOND JEWELRY",
+        "MakeType": "CASTING",
+        "Manufacturer": "EVERMORE JEWELLERY PRIVATE LIMITED",
+        "ItemSize": item_size,
+        "Parts": 1,
+        "MItemCode": map_metal_item_code(best_metal),
+        "NetWt": best_weight if best_weight > 0 else 3.5,
+        "Diamonds": diamonds,
+        "_source_image": fpath.name,
+        "_ocr_boxes": items,
+        "_source_w": img_w,
+        "_source_h": img_h
+    }
+    
+    logger.info(f"Extracted Style Code: {aligned_style_code}")
+    return extracted_data
+
+
+def compile_styles_to_excel(styles: list, output_path: Path = OUTPUT_PATH) -> dict:
+    """Compiles a list of processed styles into SJE PLUS bulk upload Excel format."""
+    if not styles:
+        logger.warning("No styles provided for Excel compilation.")
+        return {"status": "error", "message": "No styles to export"}
+
+    logger.info(f"Starting Excel compilation for {len(styles)} styles...")
+    
+    TEMPLATE_HEADERS = [
+        'SrNo', 'InwardDate', 'JewelCode', 'JewelAliasNo', 'StyleCode', 'Manufacturer', 'Category', 'SubCategory', 'StockType', 'MakeType', 
+        'InwardQty', 'ItemPcs', 'Collection', 'isBaseCollection', 'ItemSize', 'ItemCode', 'Size', 'SetCode', 'RawFormula', 'Pcs', 
+        'Weight', 'Rate', 'Amount', 'DisMarkupOn', 'DisMarkupPer', 'DisMarkupAmt', 'CostRate', 'CostAmount', 'DisMarkupCostOn', 'DisMarkupCostPer', 
+        'DisMarkupCostAmt', 'MItemCode', 'NetWt', 'MRate', 'MAmt', 'MDisMarkupOn', 'MDisMarkupPer', 'MDisMarkupAmt', 'MCostRate', 'MCostAmt', 
+        'MDisMarkupCostOn', 'MDisMarkupCostPer', 'MDisMarkupCostAmt', 'CPFRate', 'CPFIsFix', 'CPFAmt', 'CPFDisMarkupPer', 'CPFAmtDisMarkupPer', 'CPFCostRate', 'CPFCostIsFix', 
+        'CPFCostAmt', 'CPFDisMarkupCostPer', 'CPFAmtDisMarkupCostPer', 'MakingOn', 'MakingCostOn', 'Remarks', 'MiscRemarks', 'Currency', 'CurrencyValue', 'RateChartCode', 
+        'StyleAliasNo', 'SalePlusPer', 'SalePlusIsFix', 'SalePlusAmt', 'CostPlusPer', 'CostPlusIsFix', 'CostPlusAmt', 'OrderDate', 'OrderNo', 'PurchaseOrderNoOrBagNo', 
+        'PurchaseOrderNoSrNoOrBagNo', 'OrderCustomerCode', 'OrderCustomerName', 'OrderSalesPersonCode', 'OrderSalesPersonName', 'Brand', 'Gender', 'ItemPoNo', 'PoNo', 'PoDate', 
+        'ExpDelDate', 'CostDiscountPer', 'CostDiscountIsFix', 'CostDiscountAmt', 'SaleDiscountPer', 'SaleDiscountIsFix', 'SaleDiscountAmt', 'Restricted', 'IsComplete', 'TagPrice', 
+        'ProductCode', 'ReOrderQty', 'MasterQty', 'StampingInstruction', 'CustomerProductionInstruction', 'DesignProductionInstruction', 'SpecialRemarks', 'StyleHistory', 'FixPrice', 'WaxWt', 
+        'ModelWt', 'Jewelry_LabName', 'Jewelry_CertificateNo', 'BaseMetalCalculationCode', 'BaseMetalCalculationCostCode', 'MouldNo', 'MouldDescription', 'MouldQty', 'MouldWtDesc', 'ExplorationCode', 
+        'ExplorationValue', 'Location', 'Branch', 'PartyStyle_CustomerName', 'ReferenceStyleCode', 'MfgCode', 'AccessoriesCode', 'BatchNo', 'CertiBatchNo', 'NBatchNo', 
+        'NRate', 'Description', 'SetCostRate', 'SetCostAmount', 'SetDisMarkupCostOn', 'SetDisMarkupCostPer', 'SetRate', 'SetAmount', 'SetDisMarkupOn', 'SetDisMarkupPer', 
+        'HandCostRate', 'HandCostAmount', 'HandDisMarkupCostOn', 'HandDisMarkupCostPer', 'HandRate', 'HandAmount', 'HandDisMarkupOn', 'HandDisMarkupPer', 'StonePosition', 'LossPer', 
+        'MetalLossPerCalcOn', 'LossPerIsFix', 'LossWeight', 'LossCostPer', 'MetalLossPerCalcCostOn', 'LossCostPerIsFix', 'LossCostWeight', 'MakeDate', 'HsnName', 'NotBase_CPFRate', 
+        'NotBase_CPFIsFix', 'NotBase_CPFAmt', 'NotBase_CPFDisMarkupPer', 'NotBase_CPFAmtDisMarkupPer', 'NotBase_CPFCostRate', 'NotBase_CPFCostIsFix', 'NotBase_CPFCostAmt', 'NotBase_CPFDisMarkupCostPer', 'NotBase_CPFAmtDisMarkupCostPer', 'NotBase_LossPer', 
+        'NotBase_MetalLossPerCalcOn', 'NotBase_LossPerIsFix', 'NotBase_LossWeight', 'NotBase_LossCostPer', 'NotBase_MetalLossPerCalcCostOn', 'NotBase_LossCostPerIsFix', 'NotBase_LossCostWeight', 'Parts', 'MPcs', 'MAccessoriesCode', 
+        'MBatchNo', 'MCertiBatchNo', 'MNBatchNo', 'MNRate', 'MSize', 'MSetCode', 'MDescription', 'MSetCostRate', 'MSetCostAmount', 'MSetDisMarkupCostOn', 
+        'MSetDisMarkupCostPer', 'MSetRate', 'MSetAmount', 'MSetDisMarkupOn', 'MSetDisMarkupPer', 'MHandCostRate', 'MHandCostAmount', 'MHandDisMarkupCostOn', 'MHandDisMarkupCostPer', 'MHandRate', 
+        'MHandAmount', 'MHandDisMarkupOn', 'MHandDisMarkupPer', 'WebDescription', 'ParentStyleCode', 'DesignBy', 'MinWeight', 'MaxWeight', 'StoneWt', 'DefaultWt', 
+        'ProductionWeight', 'MMinWeight', 'MMaxWeight', 'MStoneWt', 'MDefaultWt', 'MProductionWeight', 'UnitPriceRounding', 'UnitCostPriceRounding', 'RhodiumInstruction', 'DiamondInstruction', 
+        'SizeInstruction', 'EndClientPrice', 'ProductionRouteCode', 'JewelryColor'
+    ]
+
+    # Check if template exists in the downloads directory
+    if TEMPLATE_PATH.exists():
+        try:
+            wb = openpyxl.load_workbook(str(TEMPLATE_PATH))
+            ws = wb["Default Format"] if "Default Format" in wb.sheetnames else wb.active
+            logger.info(f"Loaded Excel template from {TEMPLATE_PATH.name}")
+        except Exception as e:
+            logger.error(f"Failed to load template {TEMPLATE_PATH.name}: {e}. Creating new workbook.")
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "Default Format"
+            for col, h in enumerate(TEMPLATE_HEADERS, 1):
+                ws.cell(row=1, column=col, value=h)
+    else:
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Default Format"
+        for col, h in enumerate(TEMPLATE_HEADERS, 1):
+            ws.cell(row=1, column=col, value=h)
+        logger.info("Template not found, created blank workbook with all template headers.")
+            
+    # Build column map from header row
+    col_map = {str(ws.cell(row=1, column=c).value).strip(): c for c in range(1, ws.max_column + 1) if ws.cell(row=1, column=c).value}
+    
+    FIELD_MAP = {
+        "SrNo":          ["SrNo", "Sr No", "SRNO"],
+        "StyleCode":     ["StyleCode", "Style Code"],
+        "StyleDate":     ["InwardDate", "StyleDate", "Style Date", "DATE"],
+        "Category":      ["Category", "CATEGORY"],
+        "SubCategory":   ["SubCategory", "Sub Category"],
+        "StockType":     ["StockType", "Stock Type"],
+        "MakeType":      ["MakeType", "Make Type"],
+        "Manufacturer":  ["Manufacturer", "MANUFACTURER", "MFG"],
+        "ItemSize":      ["ItemSize", "Item Size"],
+        "Parts":         ["Parts", "PARTS"],
+        "MItemCode":     ["MItemCode", "MItem Code", "Metal Item Code"],
+        "NetWt":         ["NetWt", "Net Wt", "Net Weight"],
+        "DItemCode":     ["ItemCode", "DItem Code", "DItemCode", "Diamond Item Code"],
+        "DSize":         ["Size", "DSize", "Diamond Size", "Stone Size"],
+        "DPcs":          ["Pcs", "DPcs", "Diamond Pcs", "Stone Pcs"],
+        "DWeight":       ["Weight", "DWeight", "Diamond Weight", "Stone Weight"],
+        "DStonePosition":["StonePosition", "DStone Type", "DStoneType", "Stone Position", "Position"],
+        "DSettingType":  ["SetCode", "DSetting Type", "DSettingType", "Setting Type", "Setting"],
+        "RateChartCode": ["RateChartCode", "Rate Chart Code"],
+        "MakingOn":      ["MakingOn", "Making On"],
+        "MakingCostOn":  ["MakingCostOn", "Making Cost On"],
+        "BaseMetalCalculationCode": ["BaseMetalCalculationCode", "Base Metal Calculation Code"],
+        "BaseMetalCalculationCostCode": ["BaseMetalCalculationCostCode", "Base Metal Calculation Cost Code"],
+        "ParentStyleCode": ["ParentStyleCode", "Parent Style Code", "ParentStyle"],
+    }
+    
+    def find_col(field_key):
+        for name in FIELD_MAP.get(field_key, [field_key]):
+            if name in col_map:
+                return col_map[name]
+        return None
+        
+    def write_cell(row_idx, field_key, value):
+        col = find_col(field_key)
+        if col:
+            ws.cell(row=row_idx, column=col, value=value)
+            
+    start_row = 2
+    row_idx = start_row
+    
+    # Sort styles so that styles containing 2D/text sizes (containing 'x', 'X', '*', or '-') are placed first.
+    # This forces Gati SJE PLUS Excel importer (OleDb type guessing) to detect the Size column as String/Text datatype,
+    # preventing conversion crashes (e.g. "Couldn't store <11.00 x 7.5> in Size Column. Expected type is Double").
+    def has_2d_size(style_dict):
+        for d in style_dict.get("Diamonds", []) or []:
+            sz = str(d.get("Size", "")).lower()
+            if 'x' in sz or '*' in sz or '-' in sz:
+                return True
+        return False
+        
+    sorted_styles = sorted(styles, key=has_2d_size, reverse=True)
+    
+    for s in sorted_styles:
+        diamonds = s.get("Diamonds", []) or [{}]
+        for di, d in enumerate(diamonds):
+            write_cell(row_idx, "SrNo", di + 1)
+            
+            # Write duplicate style-level fields across all stone rows
+            write_cell(row_idx, "StyleCode", s.get("StyleCode", ""))
+            
+            # Parent Style Code
+            parent_style = s.get("ParentStyle", "")
+            if not parent_style:
+                style_code = s.get("StyleCode", "")
+                if style_code:
+                    if "-" in style_code:
+                        parent_style = style_code.split("-")[0].strip()
+                    else:
+                        m_parent = re.match(r'^([A-Z]\d{4,5})', style_code, re.IGNORECASE)
+                        if m_parent:
+                            parent_style = m_parent.group(1).upper()
+                        else:
+                            parent_style = style_code[:6].upper()
+            parent_style = parent_style.strip("-_").strip()
+            write_cell(row_idx, "ParentStyleCode", parent_style)
+            
+            # Parse StyleDate string to actual date/datetime object for Excel date format
+            style_date_str = s.get("StyleDate", "")
+            style_date_val = None
+            if style_date_str:
+                try:
+                    # try parsing YYYY-MM-DD
+                    style_date_val = datetime.strptime(str(style_date_str).split()[0], "%Y-%m-%d")
+                except ValueError:
+                    try:
+                        style_date_val = datetime.strptime(str(style_date_str).split()[0], "%d-%m-%Y")
+                    except ValueError:
+                        style_date_val = datetime.now()
+            else:
+                style_date_val = datetime.now()
+            write_cell(row_idx, "StyleDate", style_date_val)
+            write_cell(row_idx, "Category", map_category_code(s.get("Category", "")))
+            write_cell(row_idx, "SubCategory", s.get("SubCategory", ""))
+            write_cell(row_idx, "StockType", clean_stock_type(s.get("StockType", "")))
+            write_cell(row_idx, "MakeType", s.get("MakeType", ""))
+            write_cell(row_idx, "Manufacturer", clean_mfg_code(s.get("Manufacturer", "")))
+            write_cell(row_idx, "ItemSize", s.get("ItemSize", ""))
+            write_cell(row_idx, "Parts", s.get("Parts", 1))
+            write_cell(row_idx, "MItemCode", map_metal_item_code(s.get("MItemCode", "")))
+            write_cell(row_idx, "NetWt", s.get("NetWt", 0))
+            write_cell(row_idx, "RateChartCode", "DEFAULT")
+            write_cell(row_idx, "MakingOn", "NetWt")
+            write_cell(row_idx, "MakingCostOn", "NetWt")
+            write_cell(row_idx, "BaseMetalCalculationCode", "On Net Wt")
+            write_cell(row_idx, "BaseMetalCalculationCostCode", "On Net Wt")
+            
+            # Diamond level fields
+            if d:
+                write_cell(row_idx, "DItemCode", d.get("ItemCode", ""))
+                sz_val = match_gati_size(d.get("Size", ""))
+                is_unmatched = sz_val.startswith(SIZE_NOT_IN_DB_PREFIX)
+                clean_sz = sz_val[len(SIZE_NOT_IN_DB_PREFIX):].strip() if is_unmatched else sz_val
+                col = find_col("DSize")
+                if col:
+                    cell = ws.cell(row=row_idx, column=col, value=clean_sz)
+                    cell.data_type = 's'       # Explicitly force String cell type
+                    cell.number_format = '@'   # Explicitly set text format in Excel
+                    if is_unmatched:
+                        from openpyxl.styles import PatternFill
+                        red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+                        cell.fill = red_fill
+                write_cell(row_idx, "DPcs", d.get("Pcs", 0))
+                write_cell(row_idx, "DWeight", d.get("Weight", 0))
+                write_cell(row_idx, "DStonePosition", map_stone_position(d.get("StonePosition", "")))
+                write_cell(row_idx, "DSettingType", map_setting_type(d.get("SettingType", "")))
+            
+            row_idx += 1
+            
+    try:
+        wb.save(str(output_path))
+        logger.info(f"Excel compilation complete: {output_path.name} saved successfully ({row_idx - start_row} rows written).")
+        return {"status": "ok", "path": str(output_path), "rows_written": row_idx - start_row}
+    except PermissionError:
+        logger.error(f"Permission denied: Please close '{output_path.name}' if it is open in Excel and try again.")
+        return {"status": "error", "message": f"Permission denied: {output_path.name} is open in Excel"}
+    except Exception as e:
+        logger.error(f"Failed to save Excel compilation: {e}")
+        return {"status": "error", "message": str(e)}
+, '', base)
+    # Match EJ design codes: R/E/X prefix followed by digits (e.g. R02957-V1-OV0200, E07788-RD0060)
+    if re.match(r'^[REPBN]\d{4,5}', base, re.IGNORECASE):
+        style_code = base.upper()
+
+    # â”€â”€ Detect CAD type label (EARRING / RING / PENDANT etc.) from all OCR items â”€â”€
+    TYPE_LABELS = {
+        "EARRING": "EARRING",
+        "EARRINGS": "EARRING",
+        "PENDANT": "PENDANT",
+        "PENDANTS": "PENDANT",
+        "BANGLE": "BANGLE",
+        "BANGLES": "BANGLE",
+        "BRACELET": "BRACELET",
+        "NECKLACE": "NECKLACE",
+        "RING": "RING",
+        "RINGS": "RING",
+        "BROOCH": "BROOCH",
+    }
+    for item in items:
+        word = item['text'].strip().upper()
+        if word in TYPE_LABELS:
+            cad_type_label = TYPE_LABELS[word]
+            break
+
+    # â”€â”€ Item size: only meaningful for rings; skip for earrings/pendants etc. â”€â”€
+    RING_TYPES = {"RING", ""}   # empty means unknown â€” try to extract
+    if cad_type_label in RING_TYPES:
+        for r in left_rows:
+            row_texts = [x['text'] for x in r]
+            joined = " ".join(row_texts).lower()
+            if "size" in joined:
+                for t in row_texts:
+                    if any(p in t.upper() for p in ["EU-", "UK.", "US.", "EU", "UK", "US"]):
+                        item_size = t
+                        break
+                if item_size:
+                    break
+        item_size = normalize_item_size(item_size)
+    # For earrings, pendants, bangles etc. item_size stays empty
+    
+    # Fallback OCR for style code â€” also catches E-prefix codes
+    # Scan every OCR item for a valid EJ Design No
+    if style_code == "UNKNOWN":
+        for item in items:
+            t_clean = clean_style_code(item['text'])
+            m = EJ_DESIGN_PATTERN.search(t_clean)
+            if m:
+                candidate = m.group(1).upper()
+                # Must have at least one dash (ignore single-segment false positives)
+                if '-' in candidate:
+                    style_code = candidate
+                    logger.info(f"Style code found via OCR scan: {style_code}")
+                    break
+                    
+    # Parse Diamonds Table
+    diamonds = []
+    header_pcts = {
+        "GemType": 49.0 / 1600.0,
+        "Location": 184.0 / 1600.0,
+        "Shape": 322.0 / 1600.0,
+        "Size": 439.0 / 1600.0,
+        "Sieve": 566.0 / 1600.0,
+        "Dwt": 692.0 / 1600.0,
+        "Qty": 791.0 / 1600.0,
+        "Twt": 895.0 / 1600.0,
+        "Setting": 1045.0 / 1600.0
+    }
+    header_cx = {k: pct * img_w for k, pct in header_pcts.items()}
+    
+    header_row_found = False
+    start_table_idx = 0
+    for idx, r in enumerate(left_rows):
+        joined = " ".join([x['text'] for x in r]).lower()
+        joined_clean = joined.replace("_", "").replace("-", "").replace(" ", "")
+        if "gem" in joined_clean and "setting" in joined_clean:
+            header_row_found = True
+            start_table_idx = idx
+            break
+            
+    SKIP_KEYWORDS = {"gem type", "setting type", "total", "note", "diamond details",
+                     "size", "shape", "sieve", "qty", "twt", "dwt", "location"}
+
+    if header_row_found:
+        # Dynamically align expected column coordinates using the matched header row
+        header_row = left_rows[start_table_idx]
+        for item in header_row:
+            t_clean = item['text'].lower().replace("_", "").replace("-", "").strip()
+            target_key = None
+            if "gem" in t_clean:
+                target_key = "GemType"
+            elif "location" in t_clean:
+                target_key = "Location"
+            elif "shape" in t_clean:
+                target_key = "Shape"
+            elif "sieve" in t_clean:
+                target_key = "Sieve"
+            elif "size" in t_clean:
+                target_key = "Size"
+            elif "qty" in t_clean or "pcs" in t_clean or "quantity" in t_clean:
+                target_key = "Qty"
+            elif "wt" in t_clean or "weight" in t_clean or "dwt" in t_clean:
+                if "total" in t_clean or "twt" in t_clean or "t.wt" in t_clean:
+                    target_key = "Twt"
+                else:
+                    target_key = "Dwt"
+            elif "setting" in t_clean:
+                target_key = "Setting"
+                
+            if target_key:
+                header_cx[target_key] = item['cx']
+                logger.info(f"Dynamically aligned header column '{item['text']}' -> '{target_key}' at cx={item['cx']:.1f}")
+
+        for idx in range(start_table_idx + 1, len(left_rows)):
+            r = left_rows[idx]
+            row_texts = [x['text'] for x in r]
+            if not row_texts:
+                continue
+            first_text = row_texts[0].strip().lower()
+            if not first_text or first_text == "-" or first_text in SKIP_KEYWORDS:
+                continue
+            if "total" in first_text:
+                break
+            if all(t.strip() in ("-", "", ".") for t in row_texts):
+                continue
+
+            col_data_lists = {k: [] for k in header_cx.keys()}
+            for item in r:
+                closest_key = min(header_cx.keys(), key=lambda k: abs(item['cx'] - header_cx[k]))
+                col_data_lists[closest_key].append(item)
+            
+            col_data = {}
+            for k, items_list in col_data_lists.items():
+                items_list.sort(key=lambda x: x['cx'])
+                col_data[k] = " ".join([x['text'] for x in items_list]).strip()
+
+            gem_type = col_data.get("GemType", "").strip()
+            shape    = col_data.get("Shape",   "").strip()
+            
+            # Skip empty, placeholder, or unrecognized gem types
+            if not gem_type or gem_type == "-":
+                continue
+            
+            # Validate this is actually a stone type before processing
+            item_code_check = map_gem_item_code(gem_type, shape)
+            if item_code_check is None:
+                logger.debug(f"Skipping OCR row with unrecognized gem_type='{gem_type}' (likely noise).")
+                continue
+
+            pcs = 0
+            qty_str = col_data["Qty"]
+            if qty_str and re.match(r'^\d+$', qty_str.strip()):
+                pcs = int(qty_str)
+
+            wt  = parse_weight(col_data["Twt"])
+            dwt = parse_weight(col_data["Dwt"])
+
+            if pcs == 0 and wt > 0 and dwt > 0:
+                pcs = int(round(wt / dwt))
+
+            sz = col_data["Size"]
+            if not sz and dwt > 0:
+                if abs(dwt - 0.003) < 0.0005: sz = "0.80MM"
+                elif abs(dwt - 0.004) < 0.0005: sz = "0.90MM"
+                elif abs(dwt - 0.005) < 0.0005: sz = "1.00MM"
+                elif abs(dwt - 0.014) < 0.002:  sz = "1.50MM"
+                elif abs(dwt - 0.022) < 0.002:  sz = "1.70MM"
+
+            st = col_data["Setting"]
+            if not st:
+                st = "Prong Set"
+            if st.endswith("_"):
+                st = st[:-1]
+
+            item_code = item_code_check  # already computed and validated above
+            location = col_data.get("Location", "").strip()
+            stone_pos = map_stone_position(location) if location and location != "-" else "None"
+
+            diamonds.append({
+                "ItemCode": item_code,
+                "GemType": gem_type,
+                "Shape": shape,
+                "Size": sz if sz else col_data.get("Size", "1.00MM"),
+                "Pcs": pcs,
+                "Weight": wt,
+                "StonePosition": stone_pos,
+                "SettingType": st
+            })
+
+    if not diamonds:
+        diamonds.append({
+            "ItemCode": "DRD",
+            "GemType": "Diamond",
+            "Shape": "Round",
+            "Size": "1.00MM",
+            "Pcs": 1,
+            "Weight": 0.01,
+            "StonePosition": "None",
+            "SettingType": "Prong Set"
+        })
+        
+    # Parse Metal details
+    metal_candidates = []
+    metal_terms = ["9K", "14K", "18K", "PT950", "G14K", "G18K", "9KT", "14KT", "18KT"]
+    for item in right_items:
+        text_clean = item['text'].replace(" ", "").upper().replace("9R", "9K").replace("14R", "14K").replace("18R", "18K")
+        is_metal = False
+        matched_term = ""
+        for term in metal_terms:
+            if term in text_clean:
+                is_metal = True
+                matched_term = term
+                break
+        if is_metal:
+            orig = item['text'].upper().replace("9R", "9K").replace("14R", "14K").replace("18R", "18K")
+            norm_metal = "9K WG"
+            for m_code in ["9K WG", "14K WG", "18K WG", "PT950", "G14KTW", "G18KTW", "14K YG", "18K YG", "9K YG", "14K RG", "18K RG", "9K RG"]:
+                if m_code.replace(" ", "") in orig.replace(" ", ""):
+                    norm_metal = m_code
+                    break
+            else:
+                norm_metal = matched_term + " WG"
+                
+            row_candidates = []
+            for other in right_items:
+                if other == item:
+                    continue
+                if abs(other['cy'] - item['cy']) < 15 and other['cx'] > item['cx']:
+                    row_candidates.append(other)
+            row_candidates.sort(key=lambda o: (abs(o['cy'] - item['cy']), o['cx'] - item['cx']))
+            
+            parsed_wt = 0.0
+            for cand in row_candidates:
+                wt_val = parse_metal_weight(cand['text'])
+                if wt_val > 0.0:
+                    parsed_wt = wt_val
+                    break
+            metal_candidates.append({
+                "metal": norm_metal,
+                "weight": parsed_wt,
+                "cy": item['cy']
+            })
+            
+    total_gold_y = -1
+    for item in right_items:
+        if "total gold weight" in item['text'].lower() or "gold weight" in item['text'].lower():
+            total_gold_y = item['cy']
+            break
+            
+    best_metal = "9K WG"
+    best_weight = 0.0
+    if metal_candidates:
+        if total_gold_y != -1:
+            metal_candidates.sort(key=lambda c: abs(c['cy'] - total_gold_y))
+            best_metal = metal_candidates[0]['metal']
+            best_weight = metal_candidates[0]['weight']
+        else:
+            metal_candidates.sort(key=lambda c: c['weight'], reverse=True)
+            best_metal = metal_candidates[0]['metal']
+            best_weight = metal_candidates[0]['weight']
+            
+    # â”€â”€ Style code: strip size suffix that was auto-appended for non-ring types â”€â”€
+    if style_code != "UNKNOWN":
+        # Only align (append size) for ring-type items
+        if cad_type_label in RING_TYPES and item_size:
+            aligned_style_code = align_style_code_with_size(style_code, item_size)
+        else:
+            # For earrings/pendants just clean the code as-is
+            aligned_style_code = style_code.upper()
+    else:
+        aligned_style_code = "STYLE-LOCAL"
+
+    # â”€â”€ Parent Style: First 5-6 characters or first segment before first dash â”€â”€
+    parent_style = ""
+    if aligned_style_code and aligned_style_code != "STYLE-LOCAL":
+        if "-" in aligned_style_code:
+            parent_style = aligned_style_code.split("-")[0].strip()
+        else:
+            m_parent = re.match(r'^([A-Z]\d{4,5})', aligned_style_code, re.IGNORECASE)
+            if m_parent:
+                parent_style = m_parent.group(1).upper()
+            else:
+                parent_style = aligned_style_code[:6].upper()
+        # Clean trailing dashes/underscores from Parent Style
+        parent_style = parent_style.strip("-_").strip()
+
+    # â”€â”€ Determine SubCategory from detected type label â”€â”€
+    SUB_CATEGORY_MAP = {
+        "RING":     "",
+        "EARRING":  "",
+        "PENDANT":  "",
+        "BANGLE":   "",
+        "BRACELET": "",
+        "NECKLACE": "",
+        "BROOCH":   "",
+        "": "",
+    }
+    sub_category = SUB_CATEGORY_MAP.get(cad_type_label, "")
+
+    # â”€â”€ Category from type label â”€â”€
+    CATEGORY_MAP = {
+        "RING":     "EJR",
+        "EARRING":  "EJE",
+        "PENDANT":  "EJP",
+        "BANGLE":   "EJB",
+        "BRACELET": "EJBR",
+        "NECKLACE": "EJN",
+        "BROOCH":   "EJBR",
+        "": "EJR",
+    }
+    category = CATEGORY_MAP.get(cad_type_label, "EJR")
+
+    extracted_data = {
+        "StyleCode": aligned_style_code,
+        "StyleDate": str(date.today()),
+        "Category": category,
+        "SubCategory": sub_category,
+        "StockType": "NATURAL DIAMOND JEWELRY",
+        "MakeType": "CASTING",
+        "Manufacturer": "EVERMORE JEWELLERY PRIVATE LIMITED",
+        "ItemSize": item_size,
+        "Parts": 1,
+        "MItemCode": map_metal_item_code(best_metal),
+        "NetWt": best_weight if best_weight > 0 else 3.5,
+        "Diamonds": diamonds,
+        "_source_image": fpath.name,
+        "_ocr_boxes": items,
+        "_source_w": img_w,
+        "_source_h": img_h
+    }
+    
+    logger.info(f"Extracted Style Code: {aligned_style_code}")
+    return extracted_data
+
+
+def compile_styles_to_excel(styles: list, output_path: Path = OUTPUT_PATH) -> dict:
+    """Compiles a list of processed styles into SJE PLUS bulk upload Excel format."""
+    if not styles:
+        logger.warning("No styles provided for Excel compilation.")
+        return {"status": "error", "message": "No styles to export"}
+
+    logger.info(f"Starting Excel compilation for {len(styles)} styles...")
+    
+    TEMPLATE_HEADERS = [
+        'SrNo', 'InwardDate', 'JewelCode', 'JewelAliasNo', 'StyleCode', 'Manufacturer', 'Category', 'SubCategory', 'StockType', 'MakeType', 
+        'InwardQty', 'ItemPcs', 'Collection', 'isBaseCollection', 'ItemSize', 'ItemCode', 'Size', 'SetCode', 'RawFormula', 'Pcs', 
+        'Weight', 'Rate', 'Amount', 'DisMarkupOn', 'DisMarkupPer', 'DisMarkupAmt', 'CostRate', 'CostAmount', 'DisMarkupCostOn', 'DisMarkupCostPer', 
+        'DisMarkupCostAmt', 'MItemCode', 'NetWt', 'MRate', 'MAmt', 'MDisMarkupOn', 'MDisMarkupPer', 'MDisMarkupAmt', 'MCostRate', 'MCostAmt', 
+        'MDisMarkupCostOn', 'MDisMarkupCostPer', 'MDisMarkupCostAmt', 'CPFRate', 'CPFIsFix', 'CPFAmt', 'CPFDisMarkupPer', 'CPFAmtDisMarkupPer', 'CPFCostRate', 'CPFCostIsFix', 
+        'CPFCostAmt', 'CPFDisMarkupCostPer', 'CPFAmtDisMarkupCostPer', 'MakingOn', 'MakingCostOn', 'Remarks', 'MiscRemarks', 'Currency', 'CurrencyValue', 'RateChartCode', 
+        'StyleAliasNo', 'SalePlusPer', 'SalePlusIsFix', 'SalePlusAmt', 'CostPlusPer', 'CostPlusIsFix', 'CostPlusAmt', 'OrderDate', 'OrderNo', 'PurchaseOrderNoOrBagNo', 
+        'PurchaseOrderNoSrNoOrBagNo', 'OrderCustomerCode', 'OrderCustomerName', 'OrderSalesPersonCode', 'OrderSalesPersonName', 'Brand', 'Gender', 'ItemPoNo', 'PoNo', 'PoDate', 
+        'ExpDelDate', 'CostDiscountPer', 'CostDiscountIsFix', 'CostDiscountAmt', 'SaleDiscountPer', 'SaleDiscountIsFix', 'SaleDiscountAmt', 'Restricted', 'IsComplete', 'TagPrice', 
+        'ProductCode', 'ReOrderQty', 'MasterQty', 'StampingInstruction', 'CustomerProductionInstruction', 'DesignProductionInstruction', 'SpecialRemarks', 'StyleHistory', 'FixPrice', 'WaxWt', 
+        'ModelWt', 'Jewelry_LabName', 'Jewelry_CertificateNo', 'BaseMetalCalculationCode', 'BaseMetalCalculationCostCode', 'MouldNo', 'MouldDescription', 'MouldQty', 'MouldWtDesc', 'ExplorationCode', 
+        'ExplorationValue', 'Location', 'Branch', 'PartyStyle_CustomerName', 'ReferenceStyleCode', 'MfgCode', 'AccessoriesCode', 'BatchNo', 'CertiBatchNo', 'NBatchNo', 
+        'NRate', 'Description', 'SetCostRate', 'SetCostAmount', 'SetDisMarkupCostOn', 'SetDisMarkupCostPer', 'SetRate', 'SetAmount', 'SetDisMarkupOn', 'SetDisMarkupPer', 
+        'HandCostRate', 'HandCostAmount', 'HandDisMarkupCostOn', 'HandDisMarkupCostPer', 'HandRate', 'HandAmount', 'HandDisMarkupOn', 'HandDisMarkupPer', 'StonePosition', 'LossPer', 
+        'MetalLossPerCalcOn', 'LossPerIsFix', 'LossWeight', 'LossCostPer', 'MetalLossPerCalcCostOn', 'LossCostPerIsFix', 'LossCostWeight', 'MakeDate', 'HsnName', 'NotBase_CPFRate', 
+        'NotBase_CPFIsFix', 'NotBase_CPFAmt', 'NotBase_CPFDisMarkupPer', 'NotBase_CPFAmtDisMarkupPer', 'NotBase_CPFCostRate', 'NotBase_CPFCostIsFix', 'NotBase_CPFCostAmt', 'NotBase_CPFDisMarkupCostPer', 'NotBase_CPFAmtDisMarkupCostPer', 'NotBase_LossPer', 
+        'NotBase_MetalLossPerCalcOn', 'NotBase_LossPerIsFix', 'NotBase_LossWeight', 'NotBase_LossCostPer', 'NotBase_MetalLossPerCalcCostOn', 'NotBase_LossCostPerIsFix', 'NotBase_LossCostWeight', 'Parts', 'MPcs', 'MAccessoriesCode', 
+        'MBatchNo', 'MCertiBatchNo', 'MNBatchNo', 'MNRate', 'MSize', 'MSetCode', 'MDescription', 'MSetCostRate', 'MSetCostAmount', 'MSetDisMarkupCostOn', 
+        'MSetDisMarkupCostPer', 'MSetRate', 'MSetAmount', 'MSetDisMarkupOn', 'MSetDisMarkupPer', 'MHandCostRate', 'MHandCostAmount', 'MHandDisMarkupCostOn', 'MHandDisMarkupCostPer', 'MHandRate', 
+        'MHandAmount', 'MHandDisMarkupOn', 'MHandDisMarkupPer', 'WebDescription', 'ParentStyleCode', 'DesignBy', 'MinWeight', 'MaxWeight', 'StoneWt', 'DefaultWt', 
+        'ProductionWeight', 'MMinWeight', 'MMaxWeight', 'MStoneWt', 'MDefaultWt', 'MProductionWeight', 'UnitPriceRounding', 'UnitCostPriceRounding', 'RhodiumInstruction', 'DiamondInstruction', 
+        'SizeInstruction', 'EndClientPrice', 'ProductionRouteCode', 'JewelryColor'
+    ]
+
+    # Check if template exists in the downloads directory
+    if TEMPLATE_PATH.exists():
+        try:
+            wb = openpyxl.load_workbook(str(TEMPLATE_PATH))
+            ws = wb["Default Format"] if "Default Format" in wb.sheetnames else wb.active
+            logger.info(f"Loaded Excel template from {TEMPLATE_PATH.name}")
+        except Exception as e:
+            logger.error(f"Failed to load template {TEMPLATE_PATH.name}: {e}. Creating new workbook.")
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "Default Format"
+            for col, h in enumerate(TEMPLATE_HEADERS, 1):
+                ws.cell(row=1, column=col, value=h)
+    else:
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Default Format"
+        for col, h in enumerate(TEMPLATE_HEADERS, 1):
+            ws.cell(row=1, column=col, value=h)
+        logger.info("Template not found, created blank workbook with all template headers.")
+            
+    # Build column map from header row
+    col_map = {str(ws.cell(row=1, column=c).value).strip(): c for c in range(1, ws.max_column + 1) if ws.cell(row=1, column=c).value}
+    
+    FIELD_MAP = {
+        "SrNo":          ["SrNo", "Sr No", "SRNO"],
+        "StyleCode":     ["StyleCode", "Style Code"],
+        "StyleDate":     ["InwardDate", "StyleDate", "Style Date", "DATE"],
+        "Category":      ["Category", "CATEGORY"],
+        "SubCategory":   ["SubCategory", "Sub Category"],
+        "StockType":     ["StockType", "Stock Type"],
+        "MakeType":      ["MakeType", "Make Type"],
+        "Manufacturer":  ["Manufacturer", "MANUFACTURER", "MFG"],
+        "ItemSize":      ["ItemSize", "Item Size"],
+        "Parts":         ["Parts", "PARTS"],
+        "MItemCode":     ["MItemCode", "MItem Code", "Metal Item Code"],
+        "NetWt":         ["NetWt", "Net Wt", "Net Weight"],
+        "DItemCode":     ["ItemCode", "DItem Code", "DItemCode", "Diamond Item Code"],
+        "DSize":         ["Size", "DSize", "Diamond Size", "Stone Size"],
+        "DPcs":          ["Pcs", "DPcs", "Diamond Pcs", "Stone Pcs"],
+        "DWeight":       ["Weight", "DWeight", "Diamond Weight", "Stone Weight"],
+        "DStonePosition":["StonePosition", "DStone Type", "DStoneType", "Stone Position", "Position"],
+        "DSettingType":  ["SetCode", "DSetting Type", "DSettingType", "Setting Type", "Setting"],
+        "RateChartCode": ["RateChartCode", "Rate Chart Code"],
+        "MakingOn":      ["MakingOn", "Making On"],
+        "MakingCostOn":  ["MakingCostOn", "Making Cost On"],
+        "BaseMetalCalculationCode": ["BaseMetalCalculationCode", "Base Metal Calculation Code"],
+        "BaseMetalCalculationCostCode": ["BaseMetalCalculationCostCode", "Base Metal Calculation Cost Code"],
+        "ParentStyleCode": ["ParentStyleCode", "Parent Style Code", "ParentStyle"],
+    }
+    
+    def find_col(field_key):
+        for name in FIELD_MAP.get(field_key, [field_key]):
+            if name in col_map:
+                return col_map[name]
+        return None
+        
+    def write_cell(row_idx, field_key, value):
+        col = find_col(field_key)
+        if col:
+            ws.cell(row=row_idx, column=col, value=value)
+            
+    start_row = 2
+    row_idx = start_row
+    
+    # Sort styles so that styles containing 2D/text sizes (containing 'x', 'X', '*', or '-') are placed first.
+    # This forces Gati SJE PLUS Excel importer (OleDb type guessing) to detect the Size column as String/Text datatype,
+    # preventing conversion crashes (e.g. "Couldn't store <11.00 x 7.5> in Size Column. Expected type is Double").
+    def has_2d_size(style_dict):
+        for d in style_dict.get("Diamonds", []) or []:
+            sz = str(d.get("Size", "")).lower()
+            if 'x' in sz or '*' in sz or '-' in sz:
+                return True
+        return False
+        
+    sorted_styles = sorted(styles, key=has_2d_size, reverse=True)
+    
+    for s in sorted_styles:
+        diamonds = s.get("Diamonds", []) or [{}]
+        for di, d in enumerate(diamonds):
+            write_cell(row_idx, "SrNo", di + 1)
+            
+            # Write duplicate style-level fields across all stone rows
+            write_cell(row_idx, "StyleCode", s.get("StyleCode", ""))
+            
+            # Parent Style Code
+            parent_style = s.get("ParentStyle", "")
+            if not parent_style:
+                style_code = s.get("StyleCode", "")
+                if style_code:
+                    if "-" in style_code:
+                        parent_style = style_code.split("-")[0].strip()
+                    else:
+                        m_parent = re.match(r'^([A-Z]\d{4,5})', style_code, re.IGNORECASE)
+                        if m_parent:
+                            parent_style = m_parent.group(1).upper()
+                        else:
+                            parent_style = style_code[:6].upper()
+            parent_style = parent_style.strip("-_").strip()
+            write_cell(row_idx, "ParentStyleCode", parent_style)
+            
+            # Parse StyleDate string to actual date/datetime object for Excel date format
+            style_date_str = s.get("StyleDate", "")
+            style_date_val = None
+            if style_date_str:
+                try:
+                    # try parsing YYYY-MM-DD
+                    style_date_val = datetime.strptime(str(style_date_str).split()[0], "%Y-%m-%d")
+                except ValueError:
+                    try:
+                        style_date_val = datetime.strptime(str(style_date_str).split()[0], "%d-%m-%Y")
+                    except ValueError:
+                        style_date_val = datetime.now()
+            else:
+                style_date_val = datetime.now()
+            write_cell(row_idx, "StyleDate", style_date_val)
+            write_cell(row_idx, "Category", map_category_code(s.get("Category", "")))
+            write_cell(row_idx, "SubCategory", s.get("SubCategory", ""))
+            write_cell(row_idx, "StockType", clean_stock_type(s.get("StockType", "")))
+            write_cell(row_idx, "MakeType", s.get("MakeType", ""))
+            write_cell(row_idx, "Manufacturer", clean_mfg_code(s.get("Manufacturer", "")))
+            write_cell(row_idx, "ItemSize", s.get("ItemSize", ""))
+            write_cell(row_idx, "Parts", s.get("Parts", 1))
+            write_cell(row_idx, "MItemCode", map_metal_item_code(s.get("MItemCode", "")))
+            write_cell(row_idx, "NetWt", s.get("NetWt", 0))
+            write_cell(row_idx, "RateChartCode", "DEFAULT")
+            write_cell(row_idx, "MakingOn", "NetWt")
+            write_cell(row_idx, "MakingCostOn", "NetWt")
+            write_cell(row_idx, "BaseMetalCalculationCode", "On Net Wt")
+            write_cell(row_idx, "BaseMetalCalculationCostCode", "On Net Wt")
+            
+            # Diamond level fields
+            if d:
+                write_cell(row_idx, "DItemCode", d.get("ItemCode", ""))
+                sz_val = match_gati_size(d.get("Size", ""))
+                is_unmatched = sz_val.startswith(SIZE_NOT_IN_DB_PREFIX)
+                clean_sz = sz_val[len(SIZE_NOT_IN_DB_PREFIX):].strip() if is_unmatched else sz_val
+                col = find_col("DSize")
+                if col:
+                    cell = ws.cell(row=row_idx, column=col, value=clean_sz)
+                    cell.data_type = 's'       # Explicitly force String cell type
+                    cell.number_format = '@'   # Explicitly set text format in Excel
+                    if is_unmatched:
+                        from openpyxl.styles import PatternFill
+                        red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+                        cell.fill = red_fill
+                write_cell(row_idx, "DPcs", d.get("Pcs", 0))
+                write_cell(row_idx, "DWeight", d.get("Weight", 0))
+                write_cell(row_idx, "DStonePosition", map_stone_position(d.get("StonePosition", "")))
+                write_cell(row_idx, "DSettingType", map_setting_type(d.get("SettingType", "")))
+            
+            row_idx += 1
+            
+    try:
+        wb.save(str(output_path))
+        logger.info(f"Excel compilation complete: {output_path.name} saved successfully ({row_idx - start_row} rows written).")
+        return {"status": "ok", "path": str(output_path), "rows_written": row_idx - start_row}
+    except PermissionError:
+        logger.error(f"Permission denied: Please close '{output_path.name}' if it is open in Excel and try again.")
+        return {"status": "error", "message": f"Permission denied: {output_path.name} is open in Excel"}
+    except Exception as e:
+        logger.error(f"Failed to save Excel compilation: {e}")
+        return {"status": "error", "message": str(e)}
